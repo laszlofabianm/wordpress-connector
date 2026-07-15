@@ -1,0 +1,7 @@
+.github/
+examples/
+test/
+.env.example
+SECURITY.md
+tsconfig.json
+*.tgz

@@ -1,0 +1,43 @@
+{
+  "name": "wordpress-connector",
+  "version": "0.1.0",
+  "description": "A small, typed Node.js connector for the WordPress REST API.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "npm run build && node --test test/wordpressConnector.test.mjs",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "example:list-posts": "npm run build && node examples/list-posts.mjs"
+  },
+  "keywords": [
+    "wordpress",
+    "wordpress-rest-api",
+    "cms",
+    "publishing",
+    "typescript",
+    "api-client"
+  ],
+  "author": "Laszlo Fabian",
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "typescript": "^5.5.3"
+  }
+}
