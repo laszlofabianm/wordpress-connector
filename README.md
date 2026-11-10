@@ -14,6 +14,7 @@ comments, and authenticated connection checks.
 - Support WordPress installations hosted in a subdirectory
 - Inject a custom `fetch` implementation for tests or custom runtimes
 - Typed API errors with HTTP status, WordPress error code, and payload
+- Shared host request limits, fail-closed HTTP 403/429 handling, and upload limits
 
 ## Requirements
 
@@ -125,6 +126,76 @@ const post = await wordpress.createPost({
 The connector first uploads the binary file and then updates its metadata when
 alt text or a caption is supplied.
 
+Every uploaded file is limited to **32,000,000 bytes (32 MB)**. This conservative
+decimal limit also fits servers configured with PHP's larger `32M` binary limit.
+The file-path helper checks file size before reading; both helpers check size
+before a request can be sent. The generic runtime request path applies the same
+limit to byte arrays, ArrayBuffers, Blobs, and each file in FormData. Unknown-size
+ReadableStream bodies are rejected; use a sized Blob or byte array instead.
+
+## Hosting Request Safeguards
+
+All operations use individual endpoints such as `/wp/v2/posts`, `/wp/v2/pages`,
+and `/wp/v2/media`. The connector does not implement batch submission, and its
+generic runtime request path rejects `/batch/v1`, including encoded and
+`rest_route` query aliases, before network access. Plugin-specific individual
+endpoints continue to work.
+
+Requests are queued with these defaults:
+
+- **2 concurrent requests**, counting the entire response-body read;
+- **200 request starts in any rolling 30 seconds**, leaving headroom below the
+  host's 250-request protection threshold;
+- **32,000,000 bytes per uploaded file**.
+
+Optional constructor settings can lower the limits, or raise concurrency to at
+most **4** and the rolling budget to at most **250**:
+
+```js
+const wordpress = new WordPressConnector({
+  baseUrl: "https://example.com",
+  username: "api-user",
+  appPassword: "application-password",
+  maxConcurrency: 2,
+  maxRequestsPer30Seconds: 200,
+  maxUploadBytes: 32_000_000,
+});
+```
+
+Limits and a request circuit are shared by hostname across connector instances,
+credentials, WordPress subdirectories, and ports **within the same loaded module
+and Node.js process**. When instances specify different limits, the strictest
+concurrency and rate limits registered for that hostname remain in force for the
+process. Different processes, independently loaded copies of this package,
+hostname aliases, and other tools do not share the budget. A server may apply
+its limit to the public IP across several hostnames; coordinate those workflows
+outside this connector and avoid parallel scripts on the same hosting account.
+
+An HTTP **403 or 429 immediately opens the shared circuit**, rejects waiting
+requests, and stops later requests to the same hostname. There are **no automatic
+retries**, including for writes. Already in-flight requests can still finish;
+their writes may have succeeded and must not be blindly replayed. Restarting a
+script is not a remedy: circuit state is process-local and a restart discards it,
+while the server's IP restriction remains.
+
+After resolving the server restriction, inspect and explicitly reset the circuit:
+
+```js
+console.log(wordpress.getRequestSafetyState());
+// Only after the host restriction is resolved:
+wordpress.resetRequestCircuit();
+```
+
+`Retry-After` seconds and HTTP dates establish a minimum time before reset is
+allowed; expiry does not automatically resume requests. Resetting preserves the
+rolling request budget. Waiting for a queue slot does not consume the per-request
+network timeout.
+
+Automatic redirects are disabled because they could dispatch an unbudgeted
+request to a forbidden route. A redirect produces a normal HTTP API error: use
+the canonical site URL instead. Generic requests must remain on the configured
+origin, so credentials and request budgets cannot be redirected to another site.
+
 ## Create A Comment
 
 Authenticated users can create comments when their WordPress role and site
@@ -165,6 +236,7 @@ await wordpress.createPost({
 - `listTags()`, `createTag()`
 - `listComments()`, `getComment()`, `createComment()`, `updateComment()`, `deleteComment()`
 - `uploadMedia()`, `uploadMediaBytes()`, `updateMedia()`, `deleteMedia()`
+- `getRequestSafetyState()`, `resetRequestCircuit()`
 
 ## Error Handling
 
@@ -179,6 +251,13 @@ try {
   }
 }
 ```
+
+The original 403/429 response is a `WordPressApiError` with the server's status,
+code, and payload. Queued and subsequent requests fail locally with
+`WordPressRequestBlockedError` (also a `WordPressApiError`, code
+`wordpress_request_circuit_open`). Batch, upload-size, destination, and invalid
+configuration checks throw `WordPressRequestPolicyError` without making a
+network request.
 
 ## Development
 

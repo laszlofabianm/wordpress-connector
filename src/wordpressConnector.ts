@@ -1,5 +1,11 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { basename } from "node:path";
+import {
+  assertIndividualEndpoint, hostRequestSafety, MAX_UPLOAD_BYTES, safetyLimit,
+  WordPressApiError, WordPressRequestPolicyError, type HostRequestSafety,
+  type WordPressRequestSafetyState,
+} from "./requestSafety.js";
+export { WordPressApiError, WordPressRequestBlockedError, WordPressRequestPolicyError, type WordPressRequestSafetyState } from "./requestSafety.js";
 
 export type WordPressPostStatus =
   | "publish"
@@ -14,6 +20,12 @@ export interface WordPressConnectorConfig {
   appPassword: string;
   timeoutMs?: number;
   fetchImplementation?: typeof fetch;
+  /** Host-wide concurrency, default 2; hard maximum 4. */
+  maxConcurrency?: number;
+  /** Request starts in a rolling 30 seconds, default 200; hard maximum 250. */
+  maxRequestsPer30Seconds?: number;
+  /** Per-file upload limit; defaults to and cannot exceed 32,000,000 bytes. */
+  maxUploadBytes?: number;
 }
 
 export interface ListContentParams {
@@ -184,26 +196,14 @@ export interface WordPressUser {
 
 type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 
-export class WordPressApiError extends Error {
-  readonly status: number;
-  readonly code?: string;
-  readonly payload: unknown;
-
-  constructor(message: string, status: number, payload: unknown, code?: string) {
-    super(message);
-    this.name = "WordPressApiError";
-    this.status = status;
-    this.payload = payload;
-    if (code !== undefined) this.code = code;
-  }
-}
-
 export class WordPressConnector {
   private readonly rootApiUrl: string;
   private readonly apiBaseUrl: string;
   private readonly authHeader: string;
   private readonly timeoutMs: number;
   private readonly fetchImplementation: typeof fetch;
+  private readonly requestSafety: HostRequestSafety;
+  private readonly maxUploadBytes: number;
 
   constructor(config: WordPressConnectorConfig) {
     if (!config.baseUrl || !config.username || !config.appPassword) {
@@ -211,6 +211,10 @@ export class WordPressConnector {
     }
 
     const siteUrl = this.normalizeSiteUrl(config.baseUrl);
+    const concurrency = safetyLimit(config.maxConcurrency, 2, 4, "maxConcurrency");
+    const requests = safetyLimit(config.maxRequestsPer30Seconds, 200, 250, "maxRequestsPer30Seconds");
+    this.maxUploadBytes = safetyLimit(config.maxUploadBytes, MAX_UPLOAD_BYTES, MAX_UPLOAD_BYTES, "maxUploadBytes");
+    this.requestSafety = hostRequestSafety(new URL(siteUrl).hostname, concurrency, requests);
     this.rootApiUrl = new URL("wp-json/", siteUrl).toString();
     this.apiBaseUrl = new URL("wp-json/wp/v2/", siteUrl).toString();
     this.timeoutMs = config.timeoutMs ?? 20_000;
@@ -219,6 +223,15 @@ export class WordPressConnector {
       `${config.username}:${config.appPassword}`,
       "utf8"
     ).toString("base64")}`;
+  }
+
+  getRequestSafetyState(): WordPressRequestSafetyState {
+    return this.requestSafety.state();
+  }
+
+  /** Explicitly resume only after resolving the restriction; Retry-After is a minimum wait. */
+  resetRequestCircuit(): void {
+    this.requestSafety.reset();
   }
 
   getSiteInfo(): Promise<WordPressSiteInfo> {
@@ -315,6 +328,7 @@ export class WordPressConnector {
     mimeType = "application/octet-stream",
     options: { fileName?: string; altText?: string; caption?: string } = {}
   ): Promise<WordPressMedia> {
+    this.assertUploadSize((await stat(filePath)).size);
     const bytes = await readFile(filePath);
     const media = await this.uploadMediaBytes(
       bytes,
@@ -359,13 +373,29 @@ export class WordPressConnector {
     headers: Record<string, string> = {},
     baseUrl = this.apiBaseUrl
   ): Promise<T> {
+    const url = new URL(path, baseUrl);
+    if (url.origin !== new URL(this.rootApiUrl).origin) {
+      throw new WordPressRequestPolicyError(
+        "WordPress requests must stay on the configured site's origin.",
+        "wordpress_destination_blocked"
+      );
+    }
+    assertIndividualEndpoint(url);
+    this.assertBodyUploadSize(body);
+    const release = await this.requestSafety.acquire();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
+      // A different in-flight call may have opened the circuit after this slot was granted.
+      this.requestSafety.assertRunning();
+      // Mutable FormData may have changed while waiting in the host-wide queue.
+      this.assertBodyUploadSize(body);
       const serializedBody = this.serializeBody(body);
-      const response = await this.fetchImplementation(new URL(path, baseUrl), {
+      const response = await this.fetchImplementation(url, {
         method,
+        // Automatic redirects could silently dispatch an unbudgeted /batch/v1 request.
+        redirect: "manual",
         headers: {
           Authorization: this.authHeader,
           Accept: "application/json",
@@ -375,6 +405,10 @@ export class WordPressConnector {
         ...(serializedBody === undefined ? {} : { body: serializedBody }),
         signal: controller.signal,
       });
+
+      if (response.status === 403 || response.status === 429) {
+        this.requestSafety.stop(response.status, response.headers.get("retry-after"));
+      }
 
       const text = await response.text();
       const payload = text ? this.parseResponse(text) : null;
@@ -392,22 +426,45 @@ export class WordPressConnector {
       return payload as T;
     } finally {
       clearTimeout(timeout);
+      release();
     }
   }
 
   private serializeBody(body: unknown): BodyInit | undefined {
     if (body === undefined) return undefined;
-    if (body instanceof Uint8Array) {
+    if (body instanceof Blob || body instanceof FormData) return body;
+    if (body instanceof ArrayBuffer) return body;
+    if (ArrayBuffer.isView(body)) {
       const copy = new ArrayBuffer(body.byteLength);
-      new Uint8Array(copy).set(body);
+      new Uint8Array(copy).set(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
       return new Blob([copy]);
     }
     return JSON.stringify(body);
   }
 
   private bodyHeaders(body: unknown): Record<string, string> {
-    if (body === undefined || body instanceof Uint8Array) return {};
+    if (body === undefined || body instanceof Blob || body instanceof FormData || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return {};
     return { "Content-Type": "application/json" };
+  }
+
+  private assertUploadSize(bytes: number): void {
+    if (bytes > this.maxUploadBytes) {
+      throw new WordPressRequestPolicyError(
+        `Upload contains ${bytes} bytes; the per-file limit is ${this.maxUploadBytes} bytes (maximum 32 MB).`,
+        "wordpress_upload_too_large"
+      );
+    }
+  }
+
+  private assertBodyUploadSize(body: unknown): void {
+    if (body instanceof Blob) this.assertUploadSize(body.size);
+    else if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) this.assertUploadSize(body.byteLength);
+    else if (body instanceof FormData) body.forEach(value => {
+      if (value instanceof Blob) this.assertUploadSize(value.size);
+    });
+    else if (body instanceof ReadableStream) {
+      throw new WordPressRequestPolicyError("Streaming request bodies cannot be prechecked against the upload limit. Use a sized Blob or byte array.", "wordpress_unsupported_upload_body");
+    }
   }
 
   private parseResponse(text: string): unknown {
