@@ -1,5 +1,7 @@
 export {
   WordPressApiError,
+  WordPressRequestBlockedError,
+  WordPressRequestPolicyError,
   WordPressConnector,
   type ListCommentsParams,
   type ListContentParams,
@@ -15,6 +17,7 @@ export {
   type WordPressTerm,
   type WordPressTermInput,
   type WordPressUser,
+  type WordPressRequestSafetyState,
 } from "./wordpressConnector.js";
 
 export { getRequiredEnv, readEnvFile } from "./env.js";
